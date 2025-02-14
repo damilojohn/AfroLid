@@ -1,20 +1,21 @@
-import torch
-import torch.nn as nn
 import math
-from typing import Optional, Dict, List, Any
-from torch import Tensor
+from typing import Any, Optional
+import torch
+import torch.onnx.operators
+from torch import nn, Tensor
+import torch.nn as nn
+from typing import Optional, Dict, List, Any, Tuple
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor, nn
-from torch.nn import Parameter
+import torch
+import sys
+import torch.distributed as dist
 import uuid
+from dataclasses import dataclass, field, asdict
+from transformers.modeling_utils import PreTrainedModel
+from transformers import AutoConfig, AutoModel, AutoModelForSequenceClassification
+from .configuration_afrolid import AfroLidConfig
 
-try:
-    from xformers.components.attention import build_attention
-    from xformers.components.attention.utils import maybe_merge_masks
-
-    _xformers_available = True
-except ImportError:
-    _xformers_available = False
 
 
 def quant_noise(module, p, block_size):
@@ -116,7 +117,6 @@ def quant_noise(module, p, block_size):
     module.register_forward_pre_hook(_forward_pre_hook)
     return module
 
-
 def LayerNorm(normalized_shape, eps=1e-5, elementwise_affine=True, export=False):
     # if torch.jit.is_scripting() or torch.jit.is_tracing():
     #     export = True
@@ -157,6 +157,66 @@ class LayerDropModuleList(nn.ModuleList):
             if not self.training or (dropout_probs[i] > self.p):
                 yield m
 
+from typing import List, Callable
+from typing import Dict
+import warnings
+
+def gelu_accurate(x):
+    if not hasattr(gelu_accurate, "_a"):
+        gelu_accurate._a = math.sqrt(2 / math.pi)
+    return (
+        0.5 * x * (1 + torch.tanh(gelu_accurate._a * (x + 0.044715 * torch.pow(x, 3))))
+    )
+
+def deprecation_warning(message, stacklevel=3):
+    # don't use DeprecationWarning, since it's ignored by default
+    warnings.warn(message, stacklevel=stacklevel)
+
+def gelu(x: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.gelu(x.float()).type_as(x)
+
+def relu_squared(x: torch.Tensor):
+    return F.relu(x).pow(2)
+
+def get_activation_fn(activation: str) -> Callable:
+    """Returns the activation function corresponding to `activation`"""
+
+    if activation == "relu":
+        return F.relu
+    elif activation == "relu_squared":
+        return relu_squared
+    elif activation == "gelu":
+        return gelu
+    elif activation == "gelu_fast":
+        deprecation_warning(
+            "--activation-fn=gelu_fast has been renamed to gelu_accurate"
+        )
+        return gelu_accurate
+    elif activation == "gelu_accurate":
+        return gelu_accurate
+    elif activation == "tanh":
+        return torch.tanh
+    elif activation == "linear":
+        return lambda x: x
+    elif activation == "swish":
+        return torch.nn.SiLU
+    else:
+        raise RuntimeError("--activation-fn {} not supported".format(activation))
+
+
+class FairseqDropout(nn.Module):
+    def __init__(self, p, module_name=None):
+        super().__init__()
+        self.p = p
+        self.module_name = module_name
+        self.apply_during_inference = False
+
+    def forward(self, x, inplace: bool = False):
+        if self.p > 0 and (self.training or self.apply_during_inference):
+            return F.dropout(x, p=self.p, training=True, inplace=inplace)
+        else:
+            return x
+
 
 class TransformerEncoderLayerBase(nn.Module):
 
@@ -186,7 +246,7 @@ class TransformerEncoderLayerBase(nn.Module):
         self.dropout_module = FairseqDropout(
             cfg.dropout, module_name=self.__class__.__name__
         )
-        self.activation_fn = utils.get_activation_fn(activation=cfg.activation_fn)
+        self.activation_fn = get_activation_fn(activation=cfg.activation_fn)
         activation_dropout_p = cfg.activation_dropout
         if activation_dropout_p == 0:
             # for backwards compatibility with models that use cfg.relu_dropout
@@ -249,11 +309,7 @@ class TransformerEncoderLayerBase(nn.Module):
         else:
             self.activation_relu_or_gelu = 0
         # Batch first can not be justified but needs user to make sure
-        self.can_use_fastpath = (
-            not self.normalize_before
-            and self.activation_relu_or_gelu
-            and (self.self_attn_layer_norm.eps == self.final_layer_norm.eps)
-        )
+        self.can_use_fastpath = None
         self.cfg_checkpoint_activations = self.cfg.checkpoint_activations
         # torch version check
         # make sure BT version is >=1.12.0
@@ -521,6 +577,14 @@ class TransformerEncoderLayerBase(nn.Module):
                 return x, fc_result
             return x
 
+def safe_getattr(obj, k, default=None):
+    """Returns obj[k] if it exists and is not None, otherwise returns default."""
+    from omegaconf import OmegaConf
+
+    if OmegaConf.is_config(obj):
+        return obj[k] if k in obj and obj[k] is not None else default
+
+    return getattr(obj, k, default)
 
 class TransformerDecoderLayerBase(nn.Module):
     """Decoder layer block.
@@ -560,19 +624,19 @@ class TransformerDecoderLayerBase(nn.Module):
         )
         self.attn_ln = (
             LayerNorm(self.embed_dim)
-            if utils.safe_getattr(cfg, "scale_attn", False)
+            if safe_getattr(cfg, "scale_attn", False)
             else None
         )
         self.nh = self.self_attn.num_heads
         self.head_dim = self.self_attn.head_dim
-        scale_heads = utils.safe_getattr(cfg, "scale_heads", False)
+        scale_heads = safe_getattr(cfg, "scale_heads", False)
         self.c_attn = (
             nn.Parameter(torch.ones((self.nh,)), requires_grad=True)
             if scale_heads
             else None
         )
 
-        self.activation_fn = utils.get_activation_fn(activation=cfg.activation_fn)
+        self.activation_fn = get_activation_fn(activation=cfg.activation_fn)
         activation_dropout_p = cfg.activation_dropout
         if activation_dropout_p == 0:
             # for backwards compatibility with models that use cfg.relu_dropout
@@ -593,7 +657,7 @@ class TransformerDecoderLayerBase(nn.Module):
 
         self.ffn_layernorm = (
             LayerNorm(cfg.decoder.ffn_embed_dim)
-            if utils.safe_getattr(cfg, "scale_fc", False)
+            if safe_getattr(cfg, "scale_fc", False)
             else None
         )
         self.w_resid = (
@@ -603,7 +667,7 @@ class TransformerDecoderLayerBase(nn.Module):
                 ),
                 requires_grad=True,
             )
-            if utils.safe_getattr(cfg, "scale_resids", False)
+            if safe_getattr(cfg, "scale_resids", False)
             else None
         )
 
@@ -816,6 +880,25 @@ class TransformerDecoderLayerBase(nn.Module):
         self.need_attn = need_attn
 
 
+import torch
+import torch.nn as nn
+import math
+from typing import Optional, Dict, List, Any
+from torch import Tensor
+
+
+def make_positions(tensor, padding_idx: int, onnx_trace: bool = False):
+    """Replace non-padding symbols with their position numbers.
+
+    Position numbers begin at padding_idx+1. Padding symbols are ignored.
+    """
+    # The series of casts and type-conversions here are carefully
+    # balanced to both work with ONNX export and XLA. In particular XLA
+    # prefers ints, cumsum defaults to output longs, and ONNX doesn't know
+    # how to handle the dtype kwarg in cumsum.
+    mask = tensor.ne(padding_idx).int()
+    return (torch.cumsum(mask, dim=1).type_as(mask) * mask).long() + padding_idx
+
 class SinusoidalPositionalEmbedding(nn.Module):
     """This module produces sinusoidal positional embeddings of any length.
 
@@ -890,7 +973,7 @@ class SinusoidalPositionalEmbedding(nn.Module):
                 )
             return self.weights[self.padding_idx + pos, :].expand(bsz, 1, -1)
 
-        positions = utils.make_positions(
+        positions = make_positions(
             input, self.padding_idx, onnx_trace=self.onnx_trace
         )
         if self.onnx_trace:
@@ -1055,11 +1138,148 @@ class TransformerEncoderBase(nn.Module):
             "src_lengths": [src_lengths],
         }
 
+import torch.nn as nn
+import torch
+import sys
+import torch.distributed as dist
+# from fairseq import utils
+# from fairseq.distributed import utils as distributed_utils
+# from fairseq.modules.layer_norm import LayerNorm
+
+_MODEL_PARALLEL_GROUP = None
+# Data parallel group that the current rank belongs to.
+_DATA_PARALLEL_GROUP = None
+_USE_XLA = False
+
+def use_xla():
+    global _USE_XLA
+    return _USE_XLA
+
+def get_world_size(group):
+    if use_xla():
+        assert group[0] == "tpu"
+        my_group = _find_my_group(group[1])
+        return len(my_group)
+    elif torch.distributed.is_initialized():
+        return dist.get_world_size(group=group)
+    else:
+        return 1
+
+def get_global_world_size():
+    if use_xla():
+        return xm.xrt_world_size()
+    elif torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    else:
+        return 1
+def get_global_rank():
+    if use_xla():
+        return xm.get_ordinal()
+    elif torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    else:
+        return 0
+
+def new_groups(grouped_ranks: List[List[int]]):
+    if use_xla():
+        return ("tpu", grouped_ranks)
+    else:
+        groups = [dist.new_group(g) for g in grouped_ranks]
+        my_group_idx = _find_my_group_index(grouped_ranks)
+        return groups[my_group_idx]
+
+def get_global_group():
+    if use_xla():
+        return new_groups([list(range(get_global_world_size()))])
+    elif torch.distributed.is_initialized():
+        if not hasattr(get_global_group, "_global_group"):
+            # ideally we could use torch.distributed.group.WORLD, but it seems
+            # to cause random NCCL hangs in some cases
+            get_global_group._global_group = dist.new_group()
+        return get_global_group._global_group
+    else:
+        return None
+
+def get_global_group():
+    if use_xla():
+        return new_groups([list(range(get_global_world_size()))])
+    elif torch.distributed.is_initialized():
+        if not hasattr(get_global_group, "_global_group"):
+            # ideally we could use torch.distributed.group.WORLD, but it seems
+            # to cause random NCCL hangs in some cases
+            get_global_group._global_group = dist.new_group()
+        return get_global_group._global_group
+    else:
+        return None
+
+def _find_my_group_index(grouped_ranks):
+    my_rank = get_global_rank()
+    for i, group in enumerate(grouped_ranks):
+        if my_rank in group:
+            return i
+    raise RuntimeError
+
+
+def _find_my_group(grouped_ranks):
+    index = _find_my_group_index(grouped_ranks)
+    return grouped_ranks[index]
+
+def get_global_group():
+    if use_xla():
+        return new_groups([list(range(get_global_world_size()))])
+    elif torch.distributed.is_initialized():
+        if not hasattr(get_global_group, "_global_group"):
+            # ideally we could use torch.distributed.group.WORLD, but it seems
+            # to cause random NCCL hangs in some cases
+            get_global_group._global_group = dist.new_group()
+        return get_global_group._global_group
+    else:
+        return None
+
+def get_world_size(group):
+    if use_xla():
+        assert group[0] == "tpu"
+        my_group = _find_my_group(group[1])
+        return len(my_group)
+    elif torch.distributed.is_initialized():
+        return dist.get_world_size(group=group)
+    else:
+        return 1
+
+def get_rank(group):
+    if use_xla():
+        assert group[0] == "tpu"
+        my_group = _find_my_group(group[1])
+        return my_group.index(get_global_rank())
+    else:
+        return dist.get_rank(group=group)
+
+def mpu_get_data_parallel_group():
+    """Get the data parallel group the caller rank belongs to."""
+    assert _DATA_PARALLEL_GROUP is not None, \
+        'data parallel group is not initialized'
+    return _DATA_PARALLEL_GROUP
+
+def get_data_parallel_group():
+    """Get the data parallel group the caller rank belongs to."""
+    global _USE_MEGATRON
+    if _USE_MEGATRON:
+        return mpu_get_data_parallel_group()
+    else:
+        return get_global_group()
+
+def get_data_parallel_rank():
+    """Return my rank for the data parallel group."""
+    return get_rank(get_data_parallel_group())
+
+def get_data_parallel_world_size():
+    """Return world size for the data parallel group."""
+    return get_world_size(get_data_parallel_group())
 
 class BaseSublayer(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.activation_fn = utils.get_activation_fn(
+        self.activation_fn = get_activation_fn(
             activation=getattr(args, "activation_fn", "relu") or "relu"
         )
         self.norm = LayerNorm(args.decoder_embed_dim, export=False)
@@ -1073,7 +1293,7 @@ class BaseSublayer(nn.Module):
 class BaseLayer(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.num_workers = distributed_utils.get_data_parallel_world_size()
+        self.num_workers = get_data_parallel_world_size()
         expert_centroids = torch.empty(self.num_workers, args.decoder_embed_dim)
         torch.nn.init.orthogonal_(expert_centroids, gain=0.1)
         self.register_parameter(
@@ -1082,7 +1302,7 @@ class BaseLayer(nn.Module):
         self.expert_network = nn.Sequential(
             *([BaseSublayer(args) for _ in range(args.base_sublayers)])
         )
-        self.expert_id = distributed_utils.get_data_parallel_rank()
+        self.expert_id = get_data_parallel_rank()
         self.shuffle = args.base_shuffle
         self.cpp = self.load_assignment()
 
@@ -1178,18 +1398,7 @@ class BaseLayer(nn.Module):
             )
             raise e
 
-class FairseqDropout(nn.Module):
-    def __init__(self, p, module_name=None):
-        super().__init__()
-        self.p = p
-        self.module_name = module_name
-        self.apply_during_inference = False
 
-    def forward(self, x, inplace: bool = False):
-        if self.p > 0 and (self.training or self.apply_during_inference):
-            return F.dropout(x, p=self.p, training=True, inplace=inplace)
-        else:
-            return x
 
 class TransformerDecoderBase(nn.Module):
     """
@@ -1234,7 +1443,8 @@ class TransformerDecoderBase(nn.Module):
 
         self.embed_tokens = embed_tokens
 
-        self.embed_scale = 1.0 if cfg.no_scale_embedding else math.sqrt(embed_dim)
+        self.embed_scale = 1.0 if cfg.no_scale_embedding else math.sqrt(
+            embed_dim)
 
         if cfg.quant_noise.pq > 0:
             self.quant_noise = quant_noise(
@@ -1541,6 +1751,31 @@ def softmax(x, dim: int, onnx_trace: bool = False):
         return F.softmax(x, dim=dim, dtype=torch.float32)
 
 
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+import math
+from typing import Dict, List, Optional, Tuple
+
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+from torch.nn import Parameter
+
+try:
+    from xformers.components.attention import build_attention
+    from xformers.components.attention.utils import maybe_merge_masks
+
+    _xformers_available = True
+except ImportError:
+    _xformers_available = False
+
+
+# TODO: move this into xformers?
+# TODO: uint8 input type should just output a bool
 def _mask_for_xformers(mask: Tensor, to_dtype: Optional[torch.dtype] = None):
     """
     call to pytorch multihead accepts three mask types:
@@ -1572,6 +1807,19 @@ def _mask_for_xformers(mask: Tensor, to_dtype: Optional[torch.dtype] = None):
     mask = ~mask.to(torch.bool)
     mask = mask.to(to_dtype)
     return mask
+
+def softmax(x, dim: int, onnx_trace: bool = False):
+    if onnx_trace:
+        return F.softmax(x.float(), dim=dim)
+    else:
+        return F.softmax(x, dim=dim, dtype=torch.float32)
+
+def eval_str_dict(x, type=dict):
+    if x is None:
+        return None
+    if isinstance(x, str):
+        x = eval(x)
+    return x
 
 
 @with_incremental_state
@@ -1607,7 +1855,7 @@ class MultiheadAttention(nn.Module):
     ):
         super().__init__()
 
-        xformers_att_config = utils.eval_str_dict(xformers_att_config)
+        xformers_att_config = eval_str_dict(xformers_att_config)
         self.use_xformers = xformers_att_config is not None
         if self.use_xformers and not _xformers_available:
             raise ImportError("\n\n  Please install xFormers.")
@@ -2246,7 +2494,7 @@ class MultiheadAttention(nn.Module):
         if before_softmax:
             return attn_weights, v
 
-        attn_weights_float = utils.softmax(
+        attn_weights_float = softmax(
             attn_weights, dim=-1, onnx_trace=self.onnx_trace
         )
         attn_weights = attn_weights_float.type_as(attn_weights)
@@ -2421,60 +2669,19 @@ class MultiheadAttention(nn.Module):
         for key, value in items_to_add.items():
             state_dict[key] = value
 
-
-class EncoderDecoderModel(nn.Module):
-    """Standalone Encoder-Decoder model for Fairseq with necessary functionalities."""
-
-    def __init__(self, cfg, encoder, decoder):
-        super().__init__()
-        self.cfg = cfg
-        self.encoder = encoder
-        self.decoder = decoder
-        self.supports_align_args = True
-        self._is_generation_fast = False
-
-    def forward(self, src_tokens, src_lengths, prev_output_tokens, **kwargs):
-        """
-        Perform a forward pass.
-
-        Args:
-            src_tokens (LongTensor): Source tokens `(batch, src_len)`
-            src_lengths (LongTensor): Source lengths `(batch)`
-            prev_output_tokens (LongTensor): Previous decoder outputs `(batch, tgt_len)`
-
-        Returns:
-            Tuple: decoder output and additional info
-        """
-        encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
-        decoder_out = self.decoder(
-            prev_output_tokens, encoder_out=encoder_out, **kwargs
-        )
-        return decoder_out
-
-    def forward_decoder(self, prev_output_tokens, **kwargs):
-        return self.decoder(prev_output_tokens, **kwargs)
-
-
-
-    def output_layer(self, features, **kwargs):
-        """Project features to the default output size (typically vocabulary size)."""
-        return self.decoder.output_layer(features, **kwargs)
-
-    def max_positions(self):
-        """Maximum length supported by the model."""
-        return (self.encoder.max_positions(), self.decoder.max_positions())
-
-    def max_decoder_positions(self):
-        """Maximum length supported by the decoder."""
-        return self.decoder.max_positions()
-
-
 @dataclass
 class QuantNoiseConfig:
     _name: str = "transformer"
     pq: float = 0.0
     pq_block_size: int = 8
     scalar: float = 0.0
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(**data)
 
 @dataclass
 class EncDecBaseConfig:
@@ -2537,8 +2744,147 @@ class TransformerConfig:
     no_decoder_final_norm: bool = False
 
 # Example of instantiating the config
-config = TransformerConfig()
+main_config = TransformerConfig()
+
+
+class TokenEmbedding(nn.Module):
+    def __init__(self, vocab_size, embed_dim, padding_idx):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx)
+        self.vocab_size = vocab_size
+        self.embedding_dim = embed_dim
+        self.padding_idx = padding_idx
+
+    def forward(self, input_tokens):
+        return self.embedding(input_tokens)
+
+# Example Usage
+def initialize_embed_tokens(cfg, model='encoder'):
+    """
+    Initialize the embed_tokens layer.
+
+    Args:
+        cfg: Configuration object
+        dictionary: Vocabulary dictionary with token-to-index mapping
+
+    Returns:
+        embed_tokens: Token embedding layer
+    """
+    vocab_size = cfg.encoder.vocab_size if model == 'encoder' else cfg.decoder.vocab_size # Assuming this attribute is added in the config
+    embed_dim = cfg.encoder.embed_dim  # Assuming this attribute is added in the config
+    padding_idx = cfg.encoder.padding_idx #dictionary.pad()  # Fetch the padding index from the dictionary
+    return TokenEmbedding(vocab_size, embed_dim, padding_idx)
+
+
+class EncoderDecoderModel(nn.Module):
+    """Standalone Encoder-Decoder model for Fairseq with necessary functionalities."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.encoder = TransformerEncoderBase(cfg, enc_dictionary, encoder_embedding.embedding)
+        self.decoder = TransformerDecoderBase(cfg, dec_dictionary, decoder_embedding.embedding)
+        self.supports_align_args = True
+        self._is_generation_fast = False
+
+    def forward(self, src_tokens, src_lengths, prev_output_tokens, **kwargs):
+        """
+        Perform a forward pass.
+
+        Args:
+            src_tokens (LongTensor): Source tokens `(batch, src_len)`
+            src_lengths (LongTensor): Source lengths `(batch)`
+            prev_output_tokens (LongTensor): Previous decoder outputs `(batch, tgt_len)`
+
+        Returns:
+            Tuple: decoder output and additional info
+        """
+        encoder_out = self.encoder(src_tokens, src_lengths=src_lengths,
+                                   **kwargs)
+        decoder_out = self.decoder(
+            prev_output_tokens, encoder_out=encoder_out, **kwargs
+        )
+        return decoder_out
+
+    def forward_decoder(self, prev_output_tokens, **kwargs):
+        return self.decoder(prev_output_tokens, **kwargs)
+
+
+
+    def output_layer(self, features, **kwargs):
+        """Project features to the default output size (typically vocabulary size)."""
+        return self.decoder.output_layer(features, **kwargs)
+
+    def max_positions(self):
+        """Maximum length supported by the model."""
+        return (self.encoder.max_positions(), self.decoder.max_positions())
+
+    def max_decoder_positions(self):
+        """Maximum length supported by the decoder."""
+        return self.decoder.max_positions()
 
 
 
 
+
+
+encoder_embedding = initialize_embed_tokens(main_config)
+decoder_embedding = initialize_embed_tokens(main_config, 'decoder')
+enc_dictionary = [9]* main_config.encoder.vocab_size
+dec_dictionary = [9] * main_config.decoder.vocab_size
+
+
+class AfroLidForSequenceClassification(PreTrainedModel):
+    config_class = AfroLidConfig
+    base_model_prefix = "transformer"
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.cfg = main_config
+        self.encoder = TransformerEncoderBase(self.cfg, enc_dictionary, encoder_embedding.embedding)
+        self.decoder = TransformerDecoderBase(self.cfg, dec_dictionary, decoder_embedding.embedding)
+        self.supports_align_args = True
+        self._is_generation_fast = False
+
+    def forward(self, src_tokens, src_lengths, prev_output_tokens, **kwargs):
+        """
+        Perform a forward pass.
+
+        Args:
+            src_tokens (LongTensor): Source tokens `(batch, src_len)`
+            src_lengths (LongTensor): Source lengths `(batch)`
+            prev_output_tokens (LongTensor): Previous decoder outputs `(batch, tgt_len)`
+
+        Returns:
+            Tuple: decoder output and additional info
+        """
+        encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
+        decoder_out = self.decoder(
+            prev_output_tokens, encoder_out=encoder_out, **kwargs
+        )
+        return decoder_out
+
+    def forward_decoder(self, prev_output_tokens, **kwargs):
+        return self.decoder(prev_output_tokens, **kwargs)
+
+
+
+    def output_layer(self, features, **kwargs):
+        """Project features to the default output size (typically vocabulary size)."""
+        return self.decoder.output_layer(features, **kwargs)
+
+    def max_positions(self):
+        """Maximum length supported by the model."""
+        return (self.encoder.max_positions(), self.decoder.max_positions())
+
+    def max_decoder_positions(self):
+        """Maximum length supported by the decoder."""
+        return self.decoder.max_positions()
+
+
+config = AfroLidConfig()
+afrolid_model = AfroLidForSequenceClassification(config)
+AutoConfig.register("afrolid", AfroLidConfig)
+AutoModel.register(AfroLidConfig, AfroLidForSequenceClassification)
+AutoModelForSequenceClassification.register(
+    AfroLidConfig, AfroLidForSequenceClassification)
